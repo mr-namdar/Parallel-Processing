@@ -1,0 +1,11 @@
+./hardware/cache_line_size.txt
+./hardware/governor.txt
+./hardware/lscpu_e.txt
+./hardware/lscpu.txt
+./hardware/perf_test.txt
+./main
+./main.c
+./notes/file_inventory_initial.txt
+./.vscode/c_cpp_properties.json
+./.vscode/launch.json
+./.vscode/settings.json
