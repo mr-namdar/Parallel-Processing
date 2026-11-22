@@ -16,6 +16,7 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
 
 #define NBUCKETS 64
 #define DEFAULT_REPETITIONS 3
@@ -53,6 +54,30 @@ typedef struct {
     bool within_tolerance;
 } calibration_t;
 
+/*
+ * Fallback measurements when perf_event_open is denied in a VM:
+ *   task-clock       -> per-thread CPU time from CLOCK_THREAD_CPUTIME_ID
+ *   context-switches -> per-thread ru_nvcsw + ru_nivcsw from getrusage()
+ * These are measured from real kernel accounting; no values are estimated.
+ */
+typedef struct {
+    uint64_t task_clock_ns;
+    uint64_t context_switches;
+    bool task_clock_available;
+    bool context_switches_available;
+    int task_clock_errno;
+    int context_switches_errno;
+} event_measurement_t;
+
+typedef struct {
+    struct timespec task_clock_start;
+    struct rusage usage_start;
+    bool task_clock_started;
+    bool context_switches_started;
+    int task_clock_errno;
+    int context_switches_errno;
+} event_snapshot_t;
+
 typedef struct {
     int tid;
     int nthreads;
@@ -63,10 +88,12 @@ typedef struct {
     bool timed_out;
     race_shared_t *shared;
     pthread_barrier_t *barrier;
+    event_measurement_t events;
 } worker_arg_t;
 
 typedef struct {
     double time_s;
+    event_measurement_t events;
     uint64_t ops_min;
     uint64_t ops_max;
     uint64_t actual_total;
@@ -89,6 +116,137 @@ static double now_seconds(void)
     }
 
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
+}
+
+/* Convert a timespec to an unsigned nanosecond count. */
+static uint64_t timespec_to_ns(const struct timespec *ts)
+{
+    return (uint64_t)ts->tv_sec * 1000000000ULL + (uint64_t)ts->tv_nsec;
+}
+
+/*
+ * Begin kernel-accounting fallback measurements for the calling thread.
+ * RUSAGE_THREAD gives voluntary and involuntary context-switch counters.
+ * CLOCK_THREAD_CPUTIME_ID measures CPU time actually consumed by this thread.
+ */
+static void event_snapshot_begin(event_snapshot_t *snapshot)
+{
+    memset(snapshot, 0, sizeof(*snapshot));
+
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID,
+                      &snapshot->task_clock_start) == 0) {
+        snapshot->task_clock_started = true;
+    } else {
+        snapshot->task_clock_errno = errno;
+    }
+
+#ifdef RUSAGE_THREAD
+    if (getrusage(RUSAGE_THREAD, &snapshot->usage_start) == 0) {
+        snapshot->context_switches_started = true;
+    } else {
+        snapshot->context_switches_errno = errno;
+    }
+#else
+    snapshot->context_switches_errno = ENOTSUP;
+#endif
+}
+
+/* Finish fallback measurements and return the measured deltas. */
+static void event_snapshot_finish(const event_snapshot_t *snapshot,
+                                  event_measurement_t *measurement)
+{
+    struct timespec task_clock_end;
+    struct rusage usage_end;
+
+    memset(measurement, 0, sizeof(*measurement));
+    measurement->task_clock_errno = snapshot->task_clock_errno;
+    measurement->context_switches_errno = snapshot->context_switches_errno;
+
+    if (snapshot->task_clock_started) {
+        if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &task_clock_end) == 0) {
+            const uint64_t start_ns = timespec_to_ns(&snapshot->task_clock_start);
+            const uint64_t end_ns = timespec_to_ns(&task_clock_end);
+            if (end_ns >= start_ns) {
+                measurement->task_clock_ns = end_ns - start_ns;
+                measurement->task_clock_available = true;
+            } else {
+                measurement->task_clock_errno = EIO;
+            }
+        } else {
+            measurement->task_clock_errno = errno;
+        }
+    }
+
+#ifdef RUSAGE_THREAD
+    if (snapshot->context_switches_started) {
+        if (getrusage(RUSAGE_THREAD, &usage_end) == 0) {
+            const int64_t start_count =
+                (int64_t)snapshot->usage_start.ru_nvcsw +
+                (int64_t)snapshot->usage_start.ru_nivcsw;
+            const int64_t end_count =
+                (int64_t)usage_end.ru_nvcsw + (int64_t)usage_end.ru_nivcsw;
+            if (end_count >= start_count) {
+                measurement->context_switches =
+                    (uint64_t)(end_count - start_count);
+                measurement->context_switches_available = true;
+            } else {
+                measurement->context_switches_errno = EIO;
+            }
+        } else {
+            measurement->context_switches_errno = errno;
+        }
+    }
+#endif
+}
+
+static const char *event_status(bool available)
+{
+    return available ? "ok" : "unavailable";
+}
+
+static void print_event_values(const event_measurement_t *events)
+{
+    if (events->task_clock_available) {
+        printf("task-clock=%.3f ms [CLOCK_THREAD_CPUTIME_ID fallback]",
+               (double)events->task_clock_ns / 1000000.0);
+    } else {
+        printf("task-clock=unavailable(errno=%d: %s)",
+               events->task_clock_errno,
+               events->task_clock_errno ? strerror(events->task_clock_errno)
+                                        : "unknown error");
+    }
+
+    printf(", ");
+
+    if (events->context_switches_available) {
+        printf("context-switches=%" PRIu64
+               " [getrusage voluntary+involuntary fallback]",
+               events->context_switches);
+    } else {
+        printf("context-switches=unavailable(errno=%d: %s)",
+               events->context_switches_errno,
+               events->context_switches_errno
+                   ? strerror(events->context_switches_errno)
+                   : "unknown error");
+    }
+}
+
+static bool all_task_clock_available(const event_measurement_t *events,
+                                     size_t count)
+{
+    for (size_t i = 0; i < count; i++) {
+        if (!events[i].task_clock_available) return false;
+    }
+    return true;
+}
+
+static bool all_context_switches_available(const event_measurement_t *events,
+                                           size_t count)
+{
+    for (size_t i = 0; i < count; i++) {
+        if (!events[i].context_switches_available) return false;
+    }
+    return true;
 }
 
 static double median3(double a, double b, double c)
@@ -492,9 +650,13 @@ static uint64_t choose_default_iterations(const calibration_t *calibrations,
 }
 
 static bool serial_reference(int w, int c, uint64_t total_iters,
-                             shared_t *answer, double *elapsed_s)
+                             shared_t *answer, double *elapsed_s,
+                             event_measurement_t *events)
 {
     shared_t s = {0};
+    event_snapshot_t snapshot;
+    event_snapshot_begin(&snapshot);
+
     const double start = now_seconds();
     const double deadline = start + RUN_TIMEOUT_SECONDS;
     bool timeout = false;
@@ -509,6 +671,7 @@ static bool serial_reference(int w, int c, uint64_t total_iters,
         }
     }
 
+    event_snapshot_finish(&snapshot, events);
     *elapsed_s = now_seconds() - start;
     *answer = s;
     return !timeout && s.total == total_iters;
@@ -517,11 +680,14 @@ static bool serial_reference(int w, int c, uint64_t total_iters,
 static void *no_lock_worker(void *pointer)
 {
     worker_arg_t *arg = (worker_arg_t *)pointer;
+    event_snapshot_t snapshot;
     const int barrier_result = pthread_barrier_wait(arg->barrier);
     if (barrier_result != 0 && barrier_result != PTHREAD_BARRIER_SERIAL_THREAD) {
         return NULL;
     }
 
+    /* Begin per-thread kernel accounting immediately after the start barrier. */
+    event_snapshot_begin(&snapshot);
     const double deadline = now_seconds() + RUN_TIMEOUT_SECONDS;
     uint64_t processed = 0;
     arg->timed_out = false;
@@ -538,6 +704,7 @@ static void *no_lock_worker(void *pointer)
         processed++;
     }
 
+    event_snapshot_finish(&snapshot, &arg->events);
     arg->processed = processed;
     return NULL;
 }
@@ -581,6 +748,7 @@ static race_result_t run_no_lock_once(int nthreads, int w, int c,
         args[t].timed_out = false;
         args[t].shared = &shared;
         args[t].barrier = &barrier;
+        memset(&args[t].events, 0, sizeof(args[t].events));
 
         const int create_result = pthread_create(&threads[t], NULL, no_lock_worker, &args[t]);
         if (create_result != 0) {
@@ -608,9 +776,25 @@ static race_result_t run_no_lock_once(int nthreads, int w, int c,
 
     result.time_s = end - start;
     result.timeout = false;
+    result.events.task_clock_available = true;
+    result.events.context_switches_available = true;
     for (int t = 0; t < nthreads; t++) {
-        if (args[t].timed_out) {
-            result.timeout = true;
+        if (args[t].timed_out) result.timeout = true;
+
+        if (args[t].events.task_clock_available) {
+            result.events.task_clock_ns += args[t].events.task_clock_ns;
+        } else {
+            result.events.task_clock_available = false;
+            if (result.events.task_clock_errno == 0)
+                result.events.task_clock_errno = args[t].events.task_clock_errno;
+        }
+
+        if (args[t].events.context_switches_available) {
+            result.events.context_switches += args[t].events.context_switches;
+        } else {
+            result.events.context_switches_available = false;
+            if (result.events.context_switches_errno == 0)
+                result.events.context_switches_errno = args[t].events.context_switches_errno;
         }
     }
     result.actual_total = shared.total;
@@ -680,12 +864,21 @@ static size_t build_thread_counts(long h, int *counts, size_t capacity)
 
 static void append_serial_reference(FILE *file, double f, int c, int w,
                                     int run, double elapsed,
-                                    const shared_t *expected, bool ok)
+                                    const shared_t *expected, bool ok,
+                                    const event_measurement_t *events)
 {
-    fprintf(file, "%.1f,%d,%d,%d,%.6f,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%s\n",
+    fprintf(file,
+            "%.1f,%d,%d,%d,%.6f,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%s,",
             f, c, w, run, elapsed, expected->total,
             sum_histogram(expected), expected->max_score,
             ok ? "ok" : "timeout");
+    if (events->task_clock_available) fprintf(file, "%.0f", (double)events->task_clock_ns);
+    fprintf(file, ",CLOCK_THREAD_CPUTIME_ID,%s,%d,", event_status(events->task_clock_available),
+            events->task_clock_errno);
+    if (events->context_switches_available) fprintf(file, "%" PRIu64, events->context_switches);
+    fprintf(file, ",getrusage_RUSAGE_THREAD,%s,%d\n",
+            event_status(events->context_switches_available),
+            events->context_switches_errno);
     fflush(file);
 }
 
@@ -693,15 +886,20 @@ static double run_serial_repetitions(FILE *serial_csv, const calibration_t *cal,
                                      uint64_t total_iters, shared_t *expected)
 {
     double times[DEFAULT_REPETITIONS];
+    event_measurement_t events[DEFAULT_REPETITIONS];
     bool all_ok = true;
 
     for (int run = 1; run <= DEFAULT_REPETITIONS; run++) {
-        bool ok = serial_reference(cal->w, cal->c, total_iters, expected, &times[run - 1]);
+        bool ok = serial_reference(cal->w, cal->c, total_iters, expected,
+                                  &times[run - 1], &events[run - 1]);
         if (!ok) {
             all_ok = false;
         }
         append_serial_reference(serial_csv, cal->target_f, cal->c, cal->w,
-                                run, times[run - 1], expected, ok);
+                                run, times[run - 1], expected, ok, &events[run - 1]);
+        printf("  serial run %d: wall=%.3f s, ", run, times[run - 1]);
+        print_event_values(&events[run - 1]);
+        printf("\n");
     }
 
     const double median_time = median3(times[0], times[1], times[2]);
@@ -729,17 +927,47 @@ static void write_nolock_summary(FILE *file, double f, int c, int w, int nthread
                                                    results[2].actual_max_score);
     int ok_runs = 0;
     for (int i = 0; i < DEFAULT_REPETITIONS; i++) {
-        if (results[i].ok) {
-            ok_runs++;
-        }
+        if (results[i].ok) ok_runs++;
+    }
+
+    event_measurement_t events[DEFAULT_REPETITIONS];
+    for (int i = 0; i < DEFAULT_REPETITIONS; i++) events[i] = results[i].events;
+    const bool task_ok = all_task_clock_available(events, DEFAULT_REPETITIONS);
+    const bool switches_ok =
+        all_context_switches_available(events, DEFAULT_REPETITIONS);
+    uint64_t task_values[DEFAULT_REPETITIONS] = {0};
+    uint64_t switch_values[DEFAULT_REPETITIONS] = {0};
+    for (int i = 0; i < DEFAULT_REPETITIONS; i++) {
+        task_values[i] = events[i].task_clock_ns;
+        switch_values[i] = events[i].context_switches;
     }
 
     fprintf(file,
-            "nolock,%d,%.1f,%d,%d,%.6f,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%d,%d\n",
+            "nolock,%d,%.1f,%d,%d,%.6f,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%d,%d,",
             nthreads, f, c, w, median_time, median_actual_total, median_actual_hist,
             median_actual_max, expected->total, sum_histogram(expected),
             expected->max_score, ok_runs, DEFAULT_REPETITIONS);
+    if (task_ok) fprintf(file, "%" PRIu64, median_u64(task_values[0], task_values[1], task_values[2]));
+    fprintf(file, ",CLOCK_THREAD_CPUTIME_ID,%s,", task_ok ? "ok" : "unavailable");
+    if (switches_ok) fprintf(file, "%" PRIu64, median_u64(switch_values[0], switch_values[1], switch_values[2]));
+    fprintf(file, ",getrusage_RUSAGE_THREAD,%s\n", switches_ok ? "ok" : "unavailable");
     fflush(file);
+
+    printf("  median summary: wall=%.6f s, ", median_time);
+    if (task_ok) {
+        printf("task-clock=%.3f ms [CLOCK_THREAD_CPUTIME_ID fallback], ",
+               (double)median_u64(task_values[0], task_values[1], task_values[2]) /
+                   1000000.0);
+    } else {
+        printf("task-clock=unavailable, ");
+    }
+    if (switches_ok) {
+        printf("context-switches=%" PRIu64
+               " [getrusage fallback]\n",
+               median_u64(switch_values[0], switch_values[1], switch_values[2]));
+    } else {
+        printf("context-switches=unavailable\n");
+    }
 }
 
 static void print_usage(const char *program)
@@ -801,6 +1029,9 @@ int main(int argc, char **argv)
     }
 
     printf("Task 1 only - Locks, Contention and Amdahl's Law\n");
+    printf("Fallback measurement sources: task-clock = CLOCK_THREAD_CPUTIME_ID; ");
+    printf("context-switches = getrusage(RUSAGE_THREAD) voluntary + involuntary deltas.\n");
+    printf("Per-worker values are summed for each parallel run; wall time uses CLOCK_MONOTONIC.\n");
     printf("H (CPUs visible to this process) = %ld\n", h);
     printf("Thread counts to test:");
     for (size_t i = 0; i < thread_count_size; i++) {
@@ -881,11 +1112,11 @@ int main(int argc, char **argv)
     }
 
     fprintf(serial_csv,
-            "F,C,W,run,time_s,expected_total,expected_hist_sum,expected_max_score,status\n");
+            "F,C,W,run,time_s,expected_total,expected_hist_sum,expected_max_score,status,task_clock_ns,task_clock_source,task_clock_status,task_clock_errno,context_switches,context_switches_source,context_switches_status,context_switches_errno\n");
     fprintf(raw_csv,
-            "lock,N,F,C,W,run,time_s,ops_min,ops_max,expected_total,actual_total,expected_hist_sum,actual_hist_sum,expected_max_score,actual_max_score,bucket_mismatches,ok,status\n");
+            "lock,N,F,C,W,run,time_s,ops_min,ops_max,expected_total,actual_total,expected_hist_sum,actual_hist_sum,expected_max_score,actual_max_score,bucket_mismatches,ok,status,task_clock_ns,task_clock_source,task_clock_status,task_clock_errno,context_switches,context_switches_source,context_switches_status,context_switches_errno\n");
     fprintf(summary_csv,
-            "lock,N,F,C,W,median_time_s,median_actual_total,median_actual_hist_sum,median_actual_max_score,expected_total,expected_hist_sum,expected_max_score,ok_runs,total_runs\n");
+            "lock,N,F,C,W,median_time_s,median_actual_total,median_actual_hist_sum,median_actual_max_score,expected_total,expected_hist_sum,expected_max_score,ok_runs,total_runs,median_task_clock_ns,task_clock_source,task_clock_status,median_context_switches,context_switches_source,context_switches_status\n");
 
     printf("\nSerial references (three runs per F/C configuration):\n");
 
@@ -914,22 +1145,34 @@ int main(int argc, char **argv)
                                                   total_iters, &expected);
                 const race_result_t *r = &runs[run - 1];
                 fprintf(raw_csv,
-                        "nolock,%d,%.1f,%d,%d,%d,%.6f,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%d,%s\n",
+                        "nolock,%d,%.1f,%d,%d,%d,%.6f,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%d,%s,",
                         nthreads, cal->target_f, cal->c, cal->w, run, r->time_s,
                         r->ops_min, r->ops_max, expected.total,
                         r->actual_total, sum_histogram(&expected),
                         r->actual_hist_sum, expected.max_score,
                         r->actual_max_score, r->bucket_mismatches,
                         r->ok ? 1 : 0, r->timeout ? "timeout" : "completed");
+                if (r->events.task_clock_available)
+                    fprintf(raw_csv, "%.0f", (double)r->events.task_clock_ns);
+                fprintf(raw_csv, ",CLOCK_THREAD_CPUTIME_ID,%s,%d,",
+                        event_status(r->events.task_clock_available),
+                        r->events.task_clock_errno);
+                if (r->events.context_switches_available)
+                    fprintf(raw_csv, "%" PRIu64, r->events.context_switches);
+                fprintf(raw_csv, ",getrusage_RUSAGE_THREAD,%s,%d\n",
+                        event_status(r->events.context_switches_available),
+                        r->events.context_switches_errno);
                 fflush(raw_csv);
 
                 printf("  run %d: total=%" PRIu64 "/%" PRIu64
                        ", hist_sum=%" PRIu64 "/%" PRIu64
-                       ", time=%.3f s, ok=%d%s\n",
+                       ", wall=%.3f s, ok=%d%s, ",
                        run, r->actual_total, expected.total,
                        r->actual_hist_sum, sum_histogram(&expected),
                        r->time_s, r->ok ? 1 : 0,
                        r->timeout ? " (timeout)" : "");
+                print_event_values(&r->events);
+                printf("\n");
             }
 
             write_nolock_summary(summary_csv, cal->target_f, cal->c, cal->w,

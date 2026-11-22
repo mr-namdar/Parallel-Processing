@@ -1,0 +1,1190 @@
+#define _GNU_SOURCE
+#define _XOPEN_SOURCE 700
+
+#include <errno.h>
+#include <inttypes.h>
+#include <limits.h>
+#include <math.h>
+#include <pthread.h>
+#include <sched.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/ioctl.h>
+#include <sys/syscall.h>
+#include <linux/perf_event.h>
+
+#define NBUCKETS 64
+#define DEFAULT_REPETITIONS 3
+#define EXTRA_THREAD_COUNT 16
+#define RUN_TIMEOUT_SECONDS 60.0
+#define TARGET_SERIAL_SECONDS 2.5
+#define CAL_SHARED_ITERS 120000ULL
+#define CAL_PRIVATE_BUDGET 8000000ULL
+#define MIN_CAL_PRIVATE_ITERS 5000ULL
+#define MAX_CAL_PRIVATE_ITERS 180000ULL
+
+/* The serial reference uses ordinary fields. */
+typedef struct {
+    uint64_t hist[NBUCKETS];
+    uint64_t total;
+    uint64_t max_score;
+} shared_t;
+
+/* Volatile is used only in the intentional no-lock experiment. */
+typedef struct {
+    volatile uint64_t hist[NBUCKETS];
+    volatile uint64_t total;
+    volatile uint64_t max_score;
+} race_shared_t;
+
+typedef struct {
+    double target_f;
+    int c;
+    int w;
+    double tc_ns;
+    double a_ns;
+    double tw_ns;
+    double measured_f;
+    double serial_estimate_ns;
+    bool within_tolerance;
+} calibration_t;
+
+typedef struct {
+    uint64_t task_clock_ns;
+    uint64_t context_switches;
+    bool task_clock_available;
+    bool context_switches_available;
+    int task_clock_errno;
+    int context_switches_errno;
+} perf_measurement_t;
+
+typedef struct {
+    int task_clock_fd;
+    int context_switches_fd;
+    int task_clock_errno;
+    int context_switches_errno;
+} perf_handle_t;
+
+typedef struct {
+    int tid;
+    int nthreads;
+    int w;
+    int c;
+    uint64_t total_iters;
+    uint64_t processed;
+    bool timed_out;
+    race_shared_t *shared;
+    pthread_barrier_t *barrier;
+    perf_measurement_t perf;
+} worker_arg_t;
+
+typedef struct {
+    double time_s;
+    perf_measurement_t perf;
+    uint64_t ops_min;
+    uint64_t ops_max;
+    uint64_t actual_total;
+    uint64_t actual_hist_sum;
+    uint64_t actual_max_score;
+    uint64_t bucket_mismatches;
+    bool ok;
+    bool timeout;
+} race_result_t;
+
+static volatile uint64_t calibration_sink;
+
+static double now_seconds(void)
+{
+    struct timespec ts;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        perror("clock_gettime");
+        exit(EXIT_FAILURE);
+    }
+
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
+}
+
+/*
+ * Open software perf events for the calling Linux thread. Each benchmark
+ * worker opens its own pair; the results are summed to obtain the aggregate
+ * task-clock and context-switch counts for the parallel region.
+ *
+ * perf_event_open can be blocked by the host/VM policy. Such failures are
+ * recorded as unavailable (with errno), rather than silently reported as 0.
+ */
+static int open_software_perf_event(uint64_t config)
+{
+    struct perf_event_attr attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.type = PERF_TYPE_SOFTWARE;
+    attr.size = sizeof(attr);
+    attr.config = config;
+    attr.disabled = 1;
+    attr.exclude_hv = 1;
+
+    return (int)syscall(SYS_perf_event_open, &attr, 0, -1, -1, 0);
+}
+
+static void perf_handle_open(perf_handle_t *handle)
+{
+    handle->task_clock_fd = open_software_perf_event(PERF_COUNT_SW_TASK_CLOCK);
+    handle->task_clock_errno = (handle->task_clock_fd < 0) ? errno : 0;
+
+    handle->context_switches_fd =
+        open_software_perf_event(PERF_COUNT_SW_CONTEXT_SWITCHES);
+    handle->context_switches_errno =
+        (handle->context_switches_fd < 0) ? errno : 0;
+}
+
+static void perf_handle_start(perf_handle_t *handle)
+{
+    if (handle->task_clock_fd >= 0 &&
+        ioctl(handle->task_clock_fd, PERF_EVENT_IOC_RESET, 0) == 0 &&
+        ioctl(handle->task_clock_fd, PERF_EVENT_IOC_ENABLE, 0) == 0) {
+        /* Event is active. */
+    } else if (handle->task_clock_fd >= 0) {
+        handle->task_clock_errno = errno;
+        close(handle->task_clock_fd);
+        handle->task_clock_fd = -1;
+    }
+
+    if (handle->context_switches_fd >= 0 &&
+        ioctl(handle->context_switches_fd, PERF_EVENT_IOC_RESET, 0) == 0 &&
+        ioctl(handle->context_switches_fd, PERF_EVENT_IOC_ENABLE, 0) == 0) {
+        /* Event is active. */
+    } else if (handle->context_switches_fd >= 0) {
+        handle->context_switches_errno = errno;
+        close(handle->context_switches_fd);
+        handle->context_switches_fd = -1;
+    }
+}
+
+static void perf_read_and_close_one(int *fd, uint64_t *value, int *error_code)
+{
+    if (*fd < 0) {
+        return;
+    }
+
+    if (ioctl(*fd, PERF_EVENT_IOC_DISABLE, 0) != 0) {
+        *error_code = errno;
+        close(*fd);
+        *fd = -1;
+        return;
+    }
+
+    ssize_t bytes;
+    do {
+        bytes = read(*fd, value, sizeof(*value));
+    } while (bytes < 0 && errno == EINTR);
+
+    if (bytes != (ssize_t)sizeof(*value)) {
+        *error_code = (bytes < 0) ? errno : EIO;
+    }
+
+    close(*fd);
+    *fd = -1;
+}
+
+static void perf_handle_finish(perf_handle_t *handle,
+                               perf_measurement_t *measurement)
+{
+    memset(measurement, 0, sizeof(*measurement));
+    measurement->task_clock_errno = handle->task_clock_errno;
+    measurement->context_switches_errno = handle->context_switches_errno;
+
+    perf_read_and_close_one(&handle->task_clock_fd,
+                            &measurement->task_clock_ns,
+                            &measurement->task_clock_errno);
+    perf_read_and_close_one(&handle->context_switches_fd,
+                            &measurement->context_switches,
+                            &measurement->context_switches_errno);
+
+    measurement->task_clock_available =
+        measurement->task_clock_errno == 0 && handle->task_clock_fd == -1;
+    measurement->context_switches_available =
+        measurement->context_switches_errno == 0 && handle->context_switches_fd == -1;
+}
+
+static void perf_handle_close(perf_handle_t *handle)
+{
+    if (handle->task_clock_fd >= 0) close(handle->task_clock_fd);
+    if (handle->context_switches_fd >= 0) close(handle->context_switches_fd);
+    handle->task_clock_fd = -1;
+    handle->context_switches_fd = -1;
+}
+
+static const char *perf_status(bool available)
+{
+    return available ? "ok" : "unavailable";
+}
+
+static void print_perf_values(const perf_measurement_t *perf)
+{
+    if (perf->task_clock_available) {
+        printf("task-clock=%.3f ms", (double)perf->task_clock_ns / 1000000.0);
+    } else {
+        printf("task-clock=unavailable(errno=%d: %s)",
+               perf->task_clock_errno,
+               perf->task_clock_errno ? strerror(perf->task_clock_errno) : "unknown error");
+    }
+
+    printf(", ");
+
+    if (perf->context_switches_available) {
+        printf("context-switches=%" PRIu64, perf->context_switches);
+    } else {
+        printf("context-switches=unavailable(errno=%d: %s)",
+               perf->context_switches_errno,
+               perf->context_switches_errno ? strerror(perf->context_switches_errno) : "unknown error");
+    }
+}
+
+static bool all_perf_task_clock_available(const perf_measurement_t *p, size_t n)
+{
+    for (size_t i = 0; i < n; i++) if (!p[i].task_clock_available) return false;
+    return true;
+}
+
+static bool all_perf_context_switches_available(const perf_measurement_t *p, size_t n)
+{
+    for (size_t i = 0; i < n; i++) if (!p[i].context_switches_available) return false;
+    return true;
+}
+
+static double median3(double a, double b, double c)
+{
+    if (a > b) {
+        const double tmp = a;
+        a = b;
+        b = tmp;
+    }
+    if (b > c) {
+        const double tmp = b;
+        b = c;
+        c = tmp;
+    }
+    if (a > b) {
+        const double tmp = a;
+        a = b;
+        b = tmp;
+    }
+    return b;
+}
+
+static uint64_t median_u64(uint64_t a, uint64_t b, uint64_t c)
+{
+    if (a > b) {
+        const uint64_t tmp = a;
+        a = b;
+        b = tmp;
+    }
+    if (b > c) {
+        const uint64_t tmp = b;
+        b = c;
+        c = tmp;
+    }
+    if (a > b) {
+        const uint64_t tmp = a;
+        a = b;
+        b = tmp;
+    }
+    return b;
+}
+
+static inline uint64_t splitmix64(uint64_t *s)
+{
+    uint64_t z = (*s += 0x9E3779B97F4A7C15ULL);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    return z ^ (z >> 31);
+}
+
+/* Private part: it only uses local variables. */
+static uint64_t private_work(uint64_t i, int w)
+{
+    uint64_t rec[8];
+    uint64_t seed = i;
+    const uint8_t *p;
+    uint64_t h = 1469598103934665603ULL;
+
+    for (int j = 0; j < 8; j++) {
+        rec[j] = splitmix64(&seed);
+    }
+
+    p = (const uint8_t *)rec;
+
+    for (int r = 0; r < w; r++) {
+        for (int j = 0; j < 64; j++) {
+            h ^= p[j];
+            h *= 1099511628211ULL;
+        }
+    }
+
+    return h;
+}
+
+/* Serial critical-section work, used by the reference run. */
+static void shared_work(shared_t *s, uint64_t h, int c)
+{
+    uint64_t x = h;
+
+    for (int k = 0; k < c; k++) {
+        x = x * 6364136223846793005ULL + 1442695040888963407ULL;
+        s->hist[x >> 58]++;
+    }
+
+    s->total++;
+    if (h > s->max_score) {
+        s->max_score = h;
+    }
+}
+
+/* Same updates, but deliberately without a lock and with volatile fields. */
+static void shared_work_no_lock(race_shared_t *s, uint64_t h, int c)
+{
+    uint64_t x = h;
+
+    for (int k = 0; k < c; k++) {
+        x = x * 6364136223846793005ULL + 1442695040888963407ULL;
+        s->hist[x >> 58]++;
+    }
+
+    s->total++;
+    if (h > s->max_score) {
+        s->max_score = h;
+    }
+}
+
+static uint64_t private_calibration_iterations(int w)
+{
+    uint64_t denominator = (uint64_t)64 * (uint64_t)w;
+    uint64_t count = CAL_PRIVATE_BUDGET / denominator;
+
+    if (count < MIN_CAL_PRIVATE_ITERS) {
+        count = MIN_CAL_PRIVATE_ITERS;
+    }
+    if (count > MAX_CAL_PRIVATE_ITERS) {
+        count = MAX_CAL_PRIVATE_ITERS;
+    }
+
+    return count;
+}
+
+static double measure_private_once(int w)
+{
+    const uint64_t count = private_calibration_iterations(w);
+    uint64_t checksum = 0;
+    const double start = now_seconds();
+
+    for (uint64_t i = 0; i < count; i++) {
+        checksum ^= private_work(i + 1ULL, w);
+    }
+
+    const double end = now_seconds();
+    calibration_sink = checksum;
+    return (end - start) * 1000000000.0 / (double)count;
+}
+
+static double measure_private_ns(int w)
+{
+    const double a = measure_private_once(w);
+    const double b = measure_private_once(w);
+    const double c = measure_private_once(w);
+    return median3(a, b, c);
+}
+
+static double measure_shared_once(int c)
+{
+    shared_t s = {0};
+    const double start = now_seconds();
+
+    for (uint64_t i = 0; i < CAL_SHARED_ITERS; i++) {
+        const uint64_t h = (i * 0x9E3779B97F4A7C15ULL) ^ 0xA5A5A5A55A5A5A5AULL;
+        shared_work(&s, h, c);
+    }
+
+    const double end = now_seconds();
+    uint64_t checksum = s.total ^ s.max_score;
+    for (size_t bucket = 0; bucket < NBUCKETS; bucket++) {
+        checksum += s.hist[bucket] * ((uint64_t)bucket + 1ULL);
+    }
+    calibration_sink = checksum;
+    return (end - start) * 1000000000.0 / (double)CAL_SHARED_ITERS;
+}
+
+static double measure_shared_ns(int c)
+{
+    const double a = measure_shared_once(c);
+    const double b = measure_shared_once(c);
+    const double d = measure_shared_once(c);
+    return median3(a, b, d);
+}
+
+static int choose_w(double tc_ns, double a_ns, double target_f)
+{
+    const double estimate = tc_ns * (1.0 - target_f) / (target_f * a_ns);
+
+    if (estimate >= (double)INT_MAX) {
+        fprintf(stderr, "Calculated W is too large.\n");
+        exit(EXIT_FAILURE);
+    }
+
+    int w = (int)llround(estimate);
+    if (w < 1) {
+        w = 1;
+    }
+    return w;
+}
+
+static calibration_t calibrate_one(double target_f, int c)
+{
+    calibration_t result;
+    const double tc_ns = measure_shared_ns(c);
+    const double a_ns = measure_private_ns(1);
+    int w = choose_w(tc_ns, a_ns, target_f);
+    double tw_ns = measure_private_ns(w);
+    double measured_f = tc_ns / (tw_ns + tc_ns);
+
+    int best_w = w;
+    double best_tw_ns = tw_ns;
+    double best_f = measured_f;
+    double best_error = fabs(measured_f - target_f);
+
+    /* Keep the closest integer W in case adjacent values straddle the target. */
+    for (int attempt = 0; attempt < 8; attempt++) {
+        if (best_error <= 0.05) {
+            break;
+        }
+
+        const double scale = ((1.0 - target_f) * measured_f) /
+                             (target_f * (1.0 - measured_f));
+        double next_value = (double)w * scale;
+        if (next_value < 1.0) {
+            next_value = 1.0;
+        }
+        if (next_value > (double)INT_MAX) {
+            break;
+        }
+
+        int next_w = (int)llround(next_value);
+        if (next_w == w) {
+            if (measured_f > target_f && w < INT_MAX) {
+                next_w = w + 1;
+            } else if (measured_f < target_f && w > 1) {
+                next_w = w - 1;
+            } else {
+                break;
+            }
+        }
+        if (next_w < 1) {
+            next_w = 1;
+        }
+        if (next_w == w) {
+            break;
+        }
+
+        w = next_w;
+        tw_ns = measure_private_ns(w);
+        measured_f = tc_ns / (tw_ns + tc_ns);
+        const double error = fabs(measured_f - target_f);
+        if (error < best_error) {
+            best_error = error;
+            best_w = w;
+            best_tw_ns = tw_ns;
+            best_f = measured_f;
+        }
+    }
+
+    result.target_f = target_f;
+    result.c = c;
+    result.w = best_w;
+    result.tc_ns = tc_ns;
+    result.a_ns = a_ns;
+    result.tw_ns = best_tw_ns;
+    result.measured_f = best_f;
+    result.serial_estimate_ns = tc_ns + best_tw_ns;
+    result.within_tolerance = best_error <= 0.05;
+    return result;
+}
+
+static uint64_t sum_histogram(const shared_t *s)
+{
+    uint64_t sum = 0;
+    for (size_t i = 0; i < NBUCKETS; i++) {
+        sum += s->hist[i];
+    }
+    return sum;
+}
+
+static uint64_t sum_race_histogram(const race_shared_t *s)
+{
+    uint64_t sum = 0;
+    for (size_t i = 0; i < NBUCKETS; i++) {
+        sum += s->hist[i];
+    }
+    return sum;
+}
+
+static void write_calibration_csv(const calibration_t *calibrations, size_t count)
+{
+    FILE *file = fopen("results/calibration.csv", "w");
+    if (file == NULL) {
+        perror("results/calibration.csv");
+        exit(EXIT_FAILURE);
+    }
+
+    fprintf(file, "F,C,W,T_C_ns,a_ns,t_W_ns,F_measured,serial_estimate_ns,within_0_05\n");
+    for (size_t i = 0; i < count; i++) {
+        const calibration_t *p = &calibrations[i];
+        fprintf(file, "%.1f,%d,%d,%.3f,%.3f,%.3f,%.6f,%.3f,%d\n",
+                p->target_f, p->c, p->w, p->tc_ns, p->a_ns, p->tw_ns,
+                p->measured_f, p->serial_estimate_ns,
+                p->within_tolerance ? 1 : 0);
+    }
+
+    fclose(file);
+}
+
+static void print_calibration_table(const calibration_t *calibrations, size_t count)
+{
+    printf("\nCalibration results (C=64 is the main setting; C=16 is the extra test)\n");
+    printf(" F     C       W       T_C(ns)       a(ns)      t_W(ns)   F_measured\n");
+    printf("-----------------------------------------------------------------------\n");
+
+    for (size_t i = 0; i < count; i++) {
+        const calibration_t *p = &calibrations[i];
+        printf(" %.1f   %2d   %6d   %10.2f   %10.2f   %10.2f    %.4f%s\n",
+               p->target_f, p->c, p->w, p->tc_ns, p->a_ns, p->tw_ns,
+               p->measured_f, p->within_tolerance ? "" : "  (outside +/-0.05)");
+    }
+}
+
+static long available_cpu_count(void)
+{
+    /* The homework defines H using nproc, so prefer that exact command. */
+    FILE *pipe = popen("nproc", "r");
+    if (pipe != NULL) {
+        char buffer[64];
+        if (fgets(buffer, sizeof(buffer), pipe) != NULL) {
+            char *end = NULL;
+            const long count = strtol(buffer, &end, 10);
+            (void)pclose(pipe);
+            if (end != buffer && count > 0) {
+                return count;
+            }
+        } else {
+            (void)pclose(pipe);
+        }
+    }
+
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (sched_getaffinity(0, sizeof(set), &set) == 0) {
+        const int count = CPU_COUNT(&set);
+        if (count > 0) {
+            return (long)count;
+        }
+    }
+
+    const long count = sysconf(_SC_NPROCESSORS_ONLN);
+    return (count > 0) ? count : 1L;
+}
+
+static uint64_t greatest_common_divisor(uint64_t a, uint64_t b)
+{
+    while (b != 0ULL) {
+        const uint64_t t = b;
+        b = a % b;
+        a = t;
+    }
+    return a;
+}
+
+static uint64_t least_common_multiple(uint64_t a, uint64_t b)
+{
+    return (a / greatest_common_divisor(a, b)) * b;
+}
+
+static uint64_t rounded_iterations(uint64_t requested, long h)
+{
+    /* Keep work evenly divisible for N = 2, 4, H, and the extra N = 16 run. */
+    uint64_t divisor = least_common_multiple(2ULL, 4ULL);
+    divisor = least_common_multiple(divisor, (uint64_t)h);
+    divisor = least_common_multiple(divisor, (uint64_t)EXTRA_THREAD_COUNT);
+    if (divisor == 0ULL) {
+        return requested;
+    }
+
+    const uint64_t remainder = requested % divisor;
+    if (remainder == 0ULL) {
+        return requested;
+    }
+
+    return requested + (divisor - remainder);
+}
+
+static uint64_t choose_default_iterations(const calibration_t *calibrations,
+                                          size_t count, long h)
+{
+    double fastest_ns = calibrations[0].serial_estimate_ns;
+
+    for (size_t i = 1; i < count; i++) {
+        if (calibrations[i].serial_estimate_ns < fastest_ns) {
+            fastest_ns = calibrations[i].serial_estimate_ns;
+        }
+    }
+
+    if (fastest_ns <= 0.0) {
+        return rounded_iterations(1000000ULL, h);
+    }
+
+    const double required = TARGET_SERIAL_SECONDS * 1000000000.0 / fastest_ns;
+    if (required >= (double)UINT64_MAX) {
+        fprintf(stderr, "Automatic TOTAL_ITERS is too large; use --iters.\n");
+        exit(EXIT_FAILURE);
+    }
+
+    uint64_t iters = (uint64_t)ceil(required);
+    if (iters < 10000ULL) {
+        iters = 10000ULL;
+    }
+    return rounded_iterations(iters, h);
+}
+
+static bool serial_reference(int w, int c, uint64_t total_iters,
+                             shared_t *answer, double *elapsed_s,
+                             perf_measurement_t *perf)
+{
+    shared_t s = {0};
+    perf_handle_t perf_handle = {.task_clock_fd = -1, .context_switches_fd = -1,
+                                 .task_clock_errno = 0, .context_switches_errno = 0};
+    perf_handle_open(&perf_handle);
+
+    const double start = now_seconds();
+    perf_handle_start(&perf_handle);
+    const double deadline = start + RUN_TIMEOUT_SECONDS;
+    bool timeout = false;
+
+    for (uint64_t i = 0; i < total_iters; i++) {
+        const uint64_t h = private_work(i, w);
+        shared_work(&s, h, c);
+
+        if ((i & 4095ULL) == 0ULL && now_seconds() > deadline) {
+            timeout = true;
+            break;
+        }
+    }
+
+    perf_handle_finish(&perf_handle, perf);
+    perf_handle_close(&perf_handle);
+    *elapsed_s = now_seconds() - start;
+    *answer = s;
+    return !timeout && s.total == total_iters;
+}
+
+static void *no_lock_worker(void *pointer)
+{
+    worker_arg_t *arg = (worker_arg_t *)pointer;
+    perf_handle_t perf_handle = {.task_clock_fd = -1, .context_switches_fd = -1,
+                                 .task_clock_errno = 0, .context_switches_errno = 0};
+
+    /* Open counters before the barrier so setup is outside the measured region. */
+    perf_handle_open(&perf_handle);
+
+    const int barrier_result = pthread_barrier_wait(arg->barrier);
+    if (barrier_result != 0 && barrier_result != PTHREAD_BARRIER_SERIAL_THREAD) {
+        perf_handle_close(&perf_handle);
+        return NULL;
+    }
+
+    perf_handle_start(&perf_handle);
+    const double deadline = now_seconds() + RUN_TIMEOUT_SECONDS;
+    uint64_t processed = 0;
+    arg->timed_out = false;
+
+    for (uint64_t i = (uint64_t)arg->tid; i < arg->total_iters;
+         i += (uint64_t)arg->nthreads) {
+        if ((processed & 4095ULL) == 0ULL && now_seconds() > deadline) {
+            arg->timed_out = true;
+            break;
+        }
+
+        const uint64_t h = private_work(i, arg->w);
+        shared_work_no_lock(arg->shared, h, arg->c);
+        processed++;
+    }
+
+    perf_handle_finish(&perf_handle, &arg->perf);
+    perf_handle_close(&perf_handle);
+    arg->processed = processed;
+    return NULL;
+}
+
+static uint64_t expected_histogram_sum(const shared_t *expected)
+{
+    return sum_histogram(expected);
+}
+
+static race_result_t run_no_lock_once(int nthreads, int w, int c,
+                                      uint64_t total_iters,
+                                      const shared_t *expected)
+{
+    pthread_t *threads = calloc((size_t)nthreads, sizeof(*threads));
+    worker_arg_t *args = calloc((size_t)nthreads, sizeof(*args));
+    race_result_t result = {0};
+    race_shared_t shared = {0};
+    pthread_barrier_t barrier;
+
+    if (threads == NULL || args == NULL) {
+        perror("calloc");
+        free(threads);
+        free(args);
+        exit(EXIT_FAILURE);
+    }
+
+    if (pthread_barrier_init(&barrier, NULL, (unsigned int)(nthreads + 1)) != 0) {
+        fprintf(stderr, "Could not initialize pthread barrier.\n");
+        free(threads);
+        free(args);
+        exit(EXIT_FAILURE);
+    }
+
+    for (int t = 0; t < nthreads; t++) {
+        args[t].tid = t;
+        args[t].nthreads = nthreads;
+        args[t].w = w;
+        args[t].c = c;
+        args[t].total_iters = total_iters;
+        args[t].processed = 0;
+        args[t].timed_out = false;
+        args[t].shared = &shared;
+        args[t].barrier = &barrier;
+        memset(&args[t].perf, 0, sizeof(args[t].perf));
+
+        const int create_result = pthread_create(&threads[t], NULL, no_lock_worker, &args[t]);
+        if (create_result != 0) {
+            fprintf(stderr, "pthread_create failed: %s\n", strerror(create_result));
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    /* Main joins the same barrier so the clock starts after all workers are ready. */
+    const int barrier_result = pthread_barrier_wait(&barrier);
+    if (barrier_result != 0 && barrier_result != PTHREAD_BARRIER_SERIAL_THREAD) {
+        fprintf(stderr, "pthread_barrier_wait failed.\n");
+        exit(EXIT_FAILURE);
+    }
+
+    const double start = now_seconds();
+    for (int t = 0; t < nthreads; t++) {
+        const int join_result = pthread_join(threads[t], NULL);
+        if (join_result != 0) {
+            fprintf(stderr, "pthread_join failed: %s\n", strerror(join_result));
+            exit(EXIT_FAILURE);
+        }
+    }
+    const double end = now_seconds();
+
+    result.time_s = end - start;
+    result.timeout = false;
+    result.perf.task_clock_available = true;
+    result.perf.context_switches_available = true;
+    for (int t = 0; t < nthreads; t++) {
+        if (args[t].timed_out) result.timeout = true;
+
+        if (args[t].perf.task_clock_available) {
+            result.perf.task_clock_ns += args[t].perf.task_clock_ns;
+        } else {
+            result.perf.task_clock_available = false;
+            if (result.perf.task_clock_errno == 0)
+                result.perf.task_clock_errno = args[t].perf.task_clock_errno;
+        }
+
+        if (args[t].perf.context_switches_available) {
+            result.perf.context_switches += args[t].perf.context_switches;
+        } else {
+            result.perf.context_switches_available = false;
+            if (result.perf.context_switches_errno == 0)
+                result.perf.context_switches_errno = args[t].perf.context_switches_errno;
+        }
+    }
+    result.actual_total = shared.total;
+    result.actual_hist_sum = sum_race_histogram(&shared);
+    result.actual_max_score = shared.max_score;
+
+    result.ops_min = UINT64_MAX;
+    result.ops_max = 0;
+    for (int t = 0; t < nthreads; t++) {
+        if (args[t].processed < result.ops_min) {
+            result.ops_min = args[t].processed;
+        }
+        if (args[t].processed > result.ops_max) {
+            result.ops_max = args[t].processed;
+        }
+    }
+
+    result.bucket_mismatches = 0;
+    for (size_t b = 0; b < NBUCKETS; b++) {
+        if (shared.hist[b] != expected->hist[b]) {
+            result.bucket_mismatches++;
+        }
+    }
+
+    result.ok = !result.timeout &&
+                result.actual_total == expected->total &&
+                result.actual_hist_sum == expected_histogram_sum(expected) &&
+                result.bucket_mismatches == 0 &&
+                result.actual_max_score == expected->max_score;
+
+    (void)pthread_barrier_destroy(&barrier);
+    free(threads);
+    free(args);
+    return result;
+}
+
+static int compare_int(const void *a, const void *b)
+{
+    const int x = *(const int *)a;
+    const int y = *(const int *)b;
+    return (x > y) - (x < y);
+}
+
+static size_t build_thread_counts(long h, int *counts, size_t capacity)
+{
+    /* Task 1 requires N = 2, 4 and H. N = 16 is an extra run requested
+       for this version; when H = 8, it is also the assignment's 2H point. */
+    const int candidates[4] = {2, 4, (int)h, EXTRA_THREAD_COUNT};
+    size_t used = 0;
+
+    for (size_t i = 0; i < 4; i++) {
+        bool found = false;
+        for (size_t j = 0; j < used; j++) {
+            if (counts[j] == candidates[i]) {
+                found = true;
+                break;
+            }
+        }
+        if (!found && used < capacity) {
+            counts[used++] = candidates[i];
+        }
+    }
+
+    qsort(counts, used, sizeof(counts[0]), compare_int);
+    return used;
+}
+
+static void append_serial_reference(FILE *file, double f, int c, int w,
+                                    int run, double elapsed,
+                                    const shared_t *expected, bool ok,
+                                    const perf_measurement_t *perf)
+{
+    fprintf(file,
+            "%.1f,%d,%d,%d,%.6f,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%s,",
+            f, c, w, run, elapsed, expected->total,
+            sum_histogram(expected), expected->max_score,
+            ok ? "ok" : "timeout");
+    if (perf->task_clock_available) fprintf(file, "%.0f", (double)perf->task_clock_ns);
+    fprintf(file, ",%s,%d,", perf_status(perf->task_clock_available),
+            perf->task_clock_errno);
+    if (perf->context_switches_available) fprintf(file, "%" PRIu64, perf->context_switches);
+    fprintf(file, ",%s,%d\n", perf_status(perf->context_switches_available),
+            perf->context_switches_errno);
+    fflush(file);
+}
+
+static double run_serial_repetitions(FILE *serial_csv, const calibration_t *cal,
+                                     uint64_t total_iters, shared_t *expected)
+{
+    double times[DEFAULT_REPETITIONS];
+    perf_measurement_t perf[DEFAULT_REPETITIONS];
+    bool all_ok = true;
+
+    for (int run = 1; run <= DEFAULT_REPETITIONS; run++) {
+        bool ok = serial_reference(cal->w, cal->c, total_iters, expected,
+                                  &times[run - 1], &perf[run - 1]);
+        if (!ok) {
+            all_ok = false;
+        }
+        append_serial_reference(serial_csv, cal->target_f, cal->c, cal->w,
+                                run, times[run - 1], expected, ok, &perf[run - 1]);
+        printf("  serial run %d: wall=%.3f s, ", run, times[run - 1]);
+        print_perf_values(&perf[run - 1]);
+        printf("\n");
+    }
+
+    const double median_time = median3(times[0], times[1], times[2]);
+    printf("Serial reference: F=%.1f C=%d W=%d, median %.3f s%s\n",
+           cal->target_f, cal->c, cal->w, median_time,
+           all_ok ? "" : " (timeout: increase resources or reduce --iters)");
+    return median_time;
+}
+
+static void write_nolock_summary(FILE *file, double f, int c, int w, int nthreads,
+                                 const race_result_t results[DEFAULT_REPETITIONS],
+                                 const shared_t *expected)
+{
+    const double median_time = median3(results[0].time_s,
+                                       results[1].time_s,
+                                       results[2].time_s);
+    const uint64_t median_actual_total = median_u64(results[0].actual_total,
+                                                     results[1].actual_total,
+                                                     results[2].actual_total);
+    const uint64_t median_actual_hist = median_u64(results[0].actual_hist_sum,
+                                                    results[1].actual_hist_sum,
+                                                    results[2].actual_hist_sum);
+    const uint64_t median_actual_max = median_u64(results[0].actual_max_score,
+                                                   results[1].actual_max_score,
+                                                   results[2].actual_max_score);
+    int ok_runs = 0;
+    for (int i = 0; i < DEFAULT_REPETITIONS; i++) {
+        if (results[i].ok) ok_runs++;
+    }
+
+    perf_measurement_t perf[DEFAULT_REPETITIONS];
+    for (int i = 0; i < DEFAULT_REPETITIONS; i++) perf[i] = results[i].perf;
+    const bool task_ok = all_perf_task_clock_available(perf, DEFAULT_REPETITIONS);
+    const bool switches_ok =
+        all_perf_context_switches_available(perf, DEFAULT_REPETITIONS);
+    uint64_t task_values[DEFAULT_REPETITIONS] = {0};
+    uint64_t switch_values[DEFAULT_REPETITIONS] = {0};
+    for (int i = 0; i < DEFAULT_REPETITIONS; i++) {
+        task_values[i] = perf[i].task_clock_ns;
+        switch_values[i] = perf[i].context_switches;
+    }
+
+    fprintf(file,
+            "nolock,%d,%.1f,%d,%d,%.6f,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%d,%d,",
+            nthreads, f, c, w, median_time, median_actual_total, median_actual_hist,
+            median_actual_max, expected->total, sum_histogram(expected),
+            expected->max_score, ok_runs, DEFAULT_REPETITIONS);
+    if (task_ok) fprintf(file, "%" PRIu64, median_u64(task_values[0], task_values[1], task_values[2]));
+    fprintf(file, ",%s,", task_ok ? "ok" : "unavailable");
+    if (switches_ok) fprintf(file, "%" PRIu64, median_u64(switch_values[0], switch_values[1], switch_values[2]));
+    fprintf(file, ",%s\n", switches_ok ? "ok" : "unavailable");
+    fflush(file);
+}
+
+static void print_usage(const char *program)
+{
+    printf("Usage: %s [--iters NUMBER]\n", program);
+    printf("\n");
+    printf("Runs Task 1 only: calibration and the no-lock race experiment.\n");
+    printf("The no-lock thread counts include N=16 in addition to 2, 4 and H.\n");
+    printf("Without --iters, TOTAL_ITERS is estimated so the fastest serial case\n");
+    printf("should take about %.1f seconds. Runs use %d repetitions.\n",
+           TARGET_SERIAL_SECONDS, DEFAULT_REPETITIONS);
+}
+
+int main(int argc, char **argv)
+{
+    const double target_fractions[2] = {0.5, 0.1};
+    calibration_t calibrations[2];
+    calibration_t run_configs[4];
+    size_t calibration_count = 0;
+    size_t run_config_count = 0;
+    uint64_t requested_iters = 0;
+    bool iters_were_set = false;
+    const long h = available_cpu_count();
+    int thread_counts[4];
+    const size_t thread_count_size = build_thread_counts(h, thread_counts, 4);
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--help") == 0) {
+            print_usage(argv[0]);
+            return EXIT_SUCCESS;
+        }
+        if (strcmp(argv[i], "--iters") == 0 && i + 1 < argc) {
+            char *end = NULL;
+            errno = 0;
+            const unsigned long long parsed = strtoull(argv[i + 1], &end, 10);
+            if (errno != 0 || end == argv[i + 1] || *end != '\0' || parsed == 0ULL) {
+                fprintf(stderr, "Invalid value for --iters.\n");
+                return EXIT_FAILURE;
+            }
+            requested_iters = (uint64_t)parsed;
+            iters_were_set = true;
+            i++;
+            continue;
+        }
+        fprintf(stderr, "Unknown or incomplete argument: %s\n", argv[i]);
+        print_usage(argv[0]);
+        return EXIT_FAILURE;
+    }
+
+    if (h < 4) {
+        fprintf(stderr,
+                "Warning: only %ld CPU(s) are visible to this process. The assignment recommends at least 4 hardware threads.\n",
+                h);
+    }
+
+    if (mkdir("results", 0775) != 0 && errno != EEXIST) {
+        perror("mkdir results");
+        return EXIT_FAILURE;
+    }
+
+    printf("Task 1 only - Locks, Contention and Amdahl's Law\n");
+    printf("H (CPUs visible to this process) = %ld\n", h);
+    printf("Software perf events: task-clock and context-switches are measured per worker thread and summed.\n");
+    printf("If VMware/kernel permissions block an event, it will be reported as unavailable with errno.\n");
+    printf("Thread counts to test:");
+    for (size_t i = 0; i < thread_count_size; i++) {
+        printf(" %d", thread_counts[i]);
+    }
+    printf("\n");
+
+    /* The formal calibration is for the assignment's fixed C=64. */
+    for (size_t f = 0; f < 2; f++) {
+        calibrations[calibration_count] = calibrate_one(target_fractions[f], 64);
+        calibration_count++;
+    }
+
+    write_calibration_csv(calibrations, calibration_count);
+    print_calibration_table(calibrations, calibration_count);
+
+    /* The C=16 sensitivity run keeps the W found for C=64. */
+    for (size_t f = 0; f < calibration_count; f++) {
+        run_configs[run_config_count] = calibrations[f];
+        run_config_count++;
+
+        run_configs[run_config_count] = calibrations[f];
+        run_configs[run_config_count].c = 16;
+        run_configs[run_config_count].tc_ns = measure_shared_ns(16);
+        run_configs[run_config_count].tw_ns = measure_private_ns(calibrations[f].w);
+        run_configs[run_config_count].measured_f =
+            run_configs[run_config_count].tc_ns /
+            (run_configs[run_config_count].tc_ns + run_configs[run_config_count].tw_ns);
+        run_configs[run_config_count].serial_estimate_ns =
+            run_configs[run_config_count].tc_ns + run_configs[run_config_count].tw_ns;
+        run_configs[run_config_count].within_tolerance =
+            fabs(run_configs[run_config_count].measured_f - calibrations[f].target_f) <= 0.05;
+        run_config_count++;
+    }
+
+    FILE *sensitivity_csv = fopen("results/c16_sensitivity.csv", "w");
+    if (sensitivity_csv == NULL) {
+        perror("results/c16_sensitivity.csv");
+        return EXIT_FAILURE;
+    }
+    fprintf(sensitivity_csv, "F_target,C,W_kept_from_C64,F_measured_at_C16\n");
+    printf("\nC=16 sensitivity check (W is kept from the C=64 calibration):\n");
+    for (size_t i = 0; i < run_config_count; i++) {
+        if (run_configs[i].c == 16) {
+            fprintf(sensitivity_csv, "%.1f,16,%d,%.6f\n",
+                    run_configs[i].target_f, run_configs[i].w,
+                    run_configs[i].measured_f);
+            printf("  target F=%.1f, W=%d -> measured F at C=16: %.4f\n",
+                   run_configs[i].target_f, run_configs[i].w,
+                   run_configs[i].measured_f);
+        }
+    }
+    fclose(sensitivity_csv);
+
+    uint64_t total_iters = iters_were_set
+                               ? rounded_iterations(requested_iters, h)
+                               : choose_default_iterations(run_configs,
+                                                           run_config_count, h);
+
+    printf("\nTOTAL_ITERS = %" PRIu64 " (divisible by 2, 4, H and 16)\n",
+           total_iters);
+    if (iters_were_set) {
+        printf("TOTAL_ITERS was supplied by the command line. Check the serial times against the 2-second requirement.\n");
+    } else {
+        printf("TOTAL_ITERS was estimated from calibration to target about %.1f s for the fastest serial case.\n",
+               TARGET_SERIAL_SECONDS);
+    }
+
+    FILE *serial_csv = fopen("results/serial_reference.csv", "w");
+    FILE *raw_csv = fopen("results/nolock_raw.csv", "w");
+    FILE *summary_csv = fopen("results/nolock_summary.csv", "w");
+    if (serial_csv == NULL || raw_csv == NULL || summary_csv == NULL) {
+        perror("Could not open a results CSV file");
+        if (serial_csv != NULL) fclose(serial_csv);
+        if (raw_csv != NULL) fclose(raw_csv);
+        if (summary_csv != NULL) fclose(summary_csv);
+        return EXIT_FAILURE;
+    }
+
+    fprintf(serial_csv,
+            "F,C,W,run,time_s,expected_total,expected_hist_sum,expected_max_score,status,task_clock_ns,task_clock_status,task_clock_errno,context_switches,context_switches_status,context_switches_errno\n");
+    fprintf(raw_csv,
+            "lock,N,F,C,W,run,time_s,ops_min,ops_max,expected_total,actual_total,expected_hist_sum,actual_hist_sum,expected_max_score,actual_max_score,bucket_mismatches,ok,status,task_clock_ns,task_clock_status,task_clock_errno,context_switches,context_switches_status,context_switches_errno\n");
+    fprintf(summary_csv,
+            "lock,N,F,C,W,median_time_s,median_actual_total,median_actual_hist_sum,median_actual_max_score,expected_total,expected_hist_sum,expected_max_score,ok_runs,total_runs,median_task_clock_ns,task_clock_status,median_context_switches,context_switches_status\n");
+
+    printf("\nSerial references (three runs per F/C configuration):\n");
+
+    for (size_t case_index = 0; case_index < run_config_count; case_index++) {
+        const calibration_t *cal = &run_configs[case_index];
+        shared_t expected = {0};
+        const double serial_median = run_serial_repetitions(serial_csv, cal,
+                                                             total_iters, &expected);
+
+        if (serial_median < 2.0) {
+            printf("  NOTE: this serial median is below 2 seconds; consider rerunning with a larger --iters value.\n");
+        }
+        if (serial_median >= RUN_TIMEOUT_SECONDS) {
+            printf("  NOTE: this serial configuration reached the 60-second timeout.\n");
+        }
+
+        for (size_t n_index = 0; n_index < thread_count_size; n_index++) {
+            const int nthreads = thread_counts[n_index];
+            race_result_t runs[DEFAULT_REPETITIONS];
+
+            printf("No-lock runs: F_target=%.1f C=%d W=%d F_measured=%.3f N=%d\n",
+                   cal->target_f, cal->c, cal->w, cal->measured_f, nthreads);
+
+            for (int run = 1; run <= DEFAULT_REPETITIONS; run++) {
+                runs[run - 1] = run_no_lock_once(nthreads, cal->w, cal->c,
+                                                  total_iters, &expected);
+                const race_result_t *r = &runs[run - 1];
+                fprintf(raw_csv,
+                        "nolock,%d,%.1f,%d,%d,%d,%.6f,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%d,%s,",
+                        nthreads, cal->target_f, cal->c, cal->w, run, r->time_s,
+                        r->ops_min, r->ops_max, expected.total,
+                        r->actual_total, sum_histogram(&expected),
+                        r->actual_hist_sum, expected.max_score,
+                        r->actual_max_score, r->bucket_mismatches,
+                        r->ok ? 1 : 0, r->timeout ? "timeout" : "completed");
+                if (r->perf.task_clock_available)
+                    fprintf(raw_csv, "%.0f", (double)r->perf.task_clock_ns);
+                fprintf(raw_csv, ",%s,%d,", perf_status(r->perf.task_clock_available),
+                        r->perf.task_clock_errno);
+                if (r->perf.context_switches_available)
+                    fprintf(raw_csv, "%" PRIu64, r->perf.context_switches);
+                fprintf(raw_csv, ",%s,%d\n",
+                        perf_status(r->perf.context_switches_available),
+                        r->perf.context_switches_errno);
+                fflush(raw_csv);
+
+                printf("  run %d: total=%" PRIu64 "/%" PRIu64
+                       ", hist_sum=%" PRIu64 "/%" PRIu64
+                       ", wall=%.3f s, ok=%d%s, ",
+                       run, r->actual_total, expected.total,
+                       r->actual_hist_sum, sum_histogram(&expected),
+                       r->time_s, r->ok ? 1 : 0,
+                       r->timeout ? " (timeout)" : "");
+                print_perf_values(&r->perf);
+                printf("\n");
+            }
+
+            write_nolock_summary(summary_csv, cal->target_f, cal->c, cal->w,
+                                 nthreads, runs, &expected);
+        }
+    }
+
+    fclose(serial_csv);
+    fclose(raw_csv);
+    fclose(summary_csv);
+
+    printf("\nTask 1 finished. CSV files are in ./results/\n");
+    printf("No lock was used in the race experiment. No Task 2+ code is included.\n");
+    return EXIT_SUCCESS;
+}
