@@ -1,0 +1,1 @@
+Linux namdar-VMware-Virtual-Platform 7.3.0-11-generic #12-Ubuntu SMP PREEMPT_DYNAMIC Fri Nov  6 10:05:00 UTC 2026 x86_64 GNU/Linux

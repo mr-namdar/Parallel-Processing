@@ -8,8 +8,8 @@
       "args": [],
       "stopAtEntry": false,
       "externalConsole": false,
-      "cwd": "/home/namdar/Desktop/Parallel Processeing/Namdar HW1",
-      "program": "/home/namdar/Desktop/Parallel Processeing/Namdar HW1/build/Debug/outDebug",
+      "cwd": "/home/namdar/Desktop/Parallel Processeing/Namdar HW1/src",
+      "program": "/home/namdar/Desktop/Parallel Processeing/Namdar HW1/src/build/Debug/outDebug",
       "MIMode": "gdb",
       "miDebuggerPath": "gdb",
       "setupCommands": [

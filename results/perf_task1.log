@@ -1,0 +1,2 @@
+perf counters are unavailable in this VM/system.
+The benchmark was run with wall-clock timing from clock_gettime(CLOCK_MONOTONIC).
