@@ -1,0 +1,4 @@
+variant,iterations_per_thread,expected_total,repetitions,passed,incorrect,timeouts,crashes,errors,all_10_observed_runs_correct
+A_plain,1000000,2000000,10,0,10,10,0,0,0
+B_volatile,1000000,2000000,10,0,10,0,0,0,0
+C_seq_cst,1000000,2000000,10,10,0,0,0,0,1

@@ -1,0 +1,12 @@
+task1 :
+
+make env 
+make
+make assembly-check
+make task1-perf
+make task1-plots
+
+task2 :
+
+make
+make task2-all
