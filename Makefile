@@ -12,24 +12,29 @@ TASK2_SOURCE = src/task2.c
 TASK3_PROGRAM = build/task3
 TASK3_NOPAUSE_PROGRAM = build/task3_nopause
 TASK3_SOURCE = src/task3.c
+TASK4_PROGRAM = build/task4
+TASK4_SOURCE = src/task4.c
+TASK4_PLOT_SCRIPT = scripts/plot_task4.py
 
 # Every benchmark uses this same lock. This prevents overlapping experiments,
 # including when the user invokes make with -j.
 RUN_LOCK = build/.hw1-experiment.lock
 
-.PHONY: all task1-build task2-build task3-build task3-nopause-build \
+.PHONY: all task1-build task2-build task3-build task3-nopause-build task4-build \
         task1 task1-perf task1-all task1-plots \
         task2 run task2-plots task2-all \
         task3 task3-ttas-no-pause task3-plots task3-all \
-        plots env assembly-check clean check-task3-inputs
+        task4 task4-plots task4-all \
+        plots env assembly-check clean check-task3-inputs check-task4-inputs
 
-# Default action: compile the four binaries only; do not run benchmarks.
-all: task1-build task2-build task3-build task3-nopause-build
+# Default action: compile the task binaries only; do not run benchmarks.
+all: task1-build task2-build task3-build task3-nopause-build task4-build
 
 task1-build: $(TASK1_PROGRAM)
 task2-build: $(TASK2_PROGRAM)
 task3-build: $(TASK3_PROGRAM)
 task3-nopause-build: $(TASK3_NOPAUSE_PROGRAM)
+task4-build: $(TASK4_PROGRAM)
 
 $(TASK1_PROGRAM): $(TASK1_SOURCE)
 	@mkdir -p $(@D)
@@ -50,6 +55,11 @@ $(TASK3_PROGRAM): $(TASK3_SOURCE)
 $(TASK3_NOPAUSE_PROGRAM): $(TASK3_SOURCE)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $< -o $@ $(LDLIBS)
+
+# Task 4: Amdahl sweep. All spin locks use the required pause hint.
+$(TASK4_PROGRAM): $(TASK4_SOURCE)
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) -DUSE_PAUSE $< -o $@ $(LDLIBS)
 
 # ------------------------------- Task 1 -----------------------------------
 
@@ -119,10 +129,34 @@ task3-all:
 	$(MAKE) task3-ttas-no-pause
 	$(MAKE) task3-plots
 
+# ------------------------------- Task 4 -----------------------------------
+
+# Task 4 needs both verified calibration rows and their matching serial
+# reference measurements from Task 1 (F=0.5 and F=0.1, C=64).
+check-task4-inputs:
+	@test -s results/calibration.csv || { \
+		echo "Missing results/calibration.csv. Run 'make task1' first."; exit 1; }
+	@test -s results/serial_reference.csv || { \
+		echo "Missing results/serial_reference.csv. Run 'make task1' first."; exit 1; }
+
+task4: task4-build check-task4-inputs
+	@mkdir -p build results plots
+	flock $(RUN_LOCK) ./$(TASK4_PROGRAM)
+
+# Plot generation reads the Task 4 CSV files; it does not run benchmarks.
+task4-plots:
+	python3 src/plot_task4.py
+
+# Full Task 4 sequence: run the complete Amdahl sweep, then generate plots
+# and derived tables. The shared flock prevents overlap with other tasks.
+task4-all:
+	$(MAKE) task4
+	$(MAKE) task4-plots
+
 # ----------------------------- All plots ---------------------------------
 
 # Plot generation reads existing CSV files; it does not run benchmarks.
-plots: task1-plots task2-plots task3-plots
+plots: task1-plots task2-plots task3-plots task4-plots
 
 env:
 	bash scripts/collect_env.sh
@@ -142,4 +176,6 @@ clean:
 	rm -f results/task3_serial_raw.csv results/task3_uncontended_raw.csv results/task3_uncontended_summary.csv
 	rm -f results/task3_fairness_counts.csv results/task3_fairness_summary.csv
 	rm -f results/task3_ttas_pause_raw.csv results/task3_ttas_nopause_raw.csv
-	rm -f plots/task2_*.png plots/task3_*.png
+	rm -f results/task4_sweep_raw.csv results/task4_serial_raw.csv
+	rm -f results/task4_summary.csv results/task4_at_H.csv
+	rm -f plots/task2_*.png plots/task3_*.png plots/task4_*.png
