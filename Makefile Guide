@@ -22,4 +22,10 @@ task4 :
 
 make
 make task4-all
-make task3-plots
+make task4-plots
+
+task4 :
+
+make
+make task5-all
+make task5-plots
