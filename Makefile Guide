@@ -17,3 +17,9 @@ make
 make task3
 make task3-ttas-no-pause
 make task3-plots
+
+task4 :
+
+make
+make task4-all
+make task3-plots
