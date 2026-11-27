@@ -1,0 +1,5 @@
+placement,valid_runs,median_ns_per_handoff,min_ns,max_ns,status
+smt_siblings,0,,,,unsupported_topology
+different_cores_same_socket,3,37.402,26.950,39.107,ok
+different_numa_or_socket,3,30.649,27.965,33.683,ok
+unpinned,3,33.920,31.023,38.260,ok

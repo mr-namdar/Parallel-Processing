@@ -15,26 +15,31 @@ TASK3_SOURCE = src/task3.c
 TASK4_PROGRAM = build/task4
 TASK4_SOURCE = src/task4.c
 TASK4_PLOT_SCRIPT = scripts/plot_task4.py
+TASK5_PROGRAM = build/task5
+TASK5_SOURCE = src/task5.c
+TASK5_PLOT_SCRIPT = src/plot_task5.py
 
 # Every benchmark uses this same lock. This prevents overlapping experiments,
 # including when the user invokes make with -j.
 RUN_LOCK = build/.hw1-experiment.lock
 
-.PHONY: all task1-build task2-build task3-build task3-nopause-build task4-build \
+.PHONY: all task1-build task2-build task3-build task3-nopause-build task4-build task5-build \
         task1 task1-perf task1-all task1-plots \
         task2 run task2-plots task2-all \
         task3 task3-ttas-no-pause task3-plots task3-all \
         task4 task4-plots task4-all \
+        task5 task5-perf task5-plots task5-all task5-clean \
         plots env assembly-check clean check-task3-inputs check-task4-inputs
 
 # Default action: compile the task binaries only; do not run benchmarks.
-all: task1-build task2-build task3-build task3-nopause-build task4-build
+all: task1-build task2-build task3-build task3-nopause-build task4-build task5-build
 
 task1-build: $(TASK1_PROGRAM)
 task2-build: $(TASK2_PROGRAM)
 task3-build: $(TASK3_PROGRAM)
 task3-nopause-build: $(TASK3_NOPAUSE_PROGRAM)
 task4-build: $(TASK4_PROGRAM)
+task5-build: $(TASK5_PROGRAM)
 
 $(TASK1_PROGRAM): $(TASK1_SOURCE)
 	@mkdir -p $(@D)
@@ -60,6 +65,12 @@ $(TASK3_NOPAUSE_PROGRAM): $(TASK3_SOURCE)
 $(TASK4_PROGRAM): $(TASK4_SOURCE)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -DUSE_PAUSE $< -o $@ $(LDLIBS)
+
+# Task 5: two cache microbenchmarks (lock hand-off and false sharing).
+# The Task 5 source defines its own GNU/XOPEN feature macros and TTAS pause hint.
+$(TASK5_PROGRAM): $(TASK5_SOURCE)
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $< -o $@ $(LDLIBS)
 
 # ------------------------------- Task 1 -----------------------------------
 
@@ -153,10 +164,41 @@ task4-all:
 	$(MAKE) task4
 	$(MAKE) task4-plots
 
+# ------------------------------- Task 5 -----------------------------------
+
+# Run only the two Task 5 microbenchmarks. CPU topology is read in memory
+# by task5.c for placement detection; no lscpu/governor/CPU-info files are written.
+task5: task5-build
+	@mkdir -p build results plots
+	flock $(RUN_LOCK) ./$(TASK5_PROGRAM) results
+
+# Optional perf measurements for Task 5. No CPU-information files are created.
+task5-perf: task5-build
+	@mkdir -p build results plots
+	flock $(RUN_LOCK) perf stat -o results/task5_perf.txt \
+		-e task-clock,context-switches,cache-misses -- ./$(TASK5_PROGRAM) results
+
+# Generate Task 5 summary CSVs and charts from the raw measurements.
+task5-plots:
+	python3 $(TASK5_PLOT_SCRIPT) --input results --output plots
+
+# Run both Task 5 experiments and then generate their plots.
+task5-all:
+	$(MAKE) task5
+	$(MAKE) task5-plots
+
+# Remove only Task 5 result CSVs, optional perf log and plots.
+# Existing lscpu/governor/cache information files are not touched.
+task5-clean:
+	rm -f results/task5a_handoff.csv results/task5b_false_sharing.csv
+	rm -f results/task5a_handoff_summary.csv results/task5b_false_sharing_summary.csv
+	rm -f results/task5_perf.txt
+	rm -f plots/task5a_handoff.png plots/task5b_false_sharing.png
+
 # ----------------------------- All plots ---------------------------------
 
 # Plot generation reads existing CSV files; it does not run benchmarks.
-plots: task1-plots task2-plots task3-plots task4-plots
+plots: task1-plots task2-plots task3-plots task4-plots task5-plots
 
 env:
 	bash scripts/collect_env.sh
@@ -178,4 +220,7 @@ clean:
 	rm -f results/task3_ttas_pause_raw.csv results/task3_ttas_nopause_raw.csv
 	rm -f results/task4_sweep_raw.csv results/task4_serial_raw.csv
 	rm -f results/task4_summary.csv results/task4_at_H.csv
-	rm -f plots/task2_*.png plots/task3_*.png plots/task4_*.png
+	rm -f results/task5a_handoff.csv results/task5b_false_sharing.csv
+	rm -f results/task5a_handoff_summary.csv results/task5b_false_sharing_summary.csv
+	rm -f results/task5_perf.txt
+	rm -f plots/task2_*.png plots/task3_*.png plots/task4_*.png plots/task5_*.png

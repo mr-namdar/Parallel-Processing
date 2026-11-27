@@ -1,0 +1,13 @@
+placement,cpu0,cpu1,run,duration_s,elapsed_s,acq_thread0,acq_thread1,total_acq,ns_per_handoff,affinity_rc0,affinity_rc1,first_cpu0,last_cpu0,migrations0,first_cpu1,last_cpu1,migrations1,status
+smt_siblings,-1,-1,1,1.000,0,0,0,0,0,0,0,-1,-1,0,-1,-1,0,unsupported_topology
+smt_siblings,-1,-1,2,1.000,0,0,0,0,0,0,0,-1,-1,0,-1,-1,0,unsupported_topology
+smt_siblings,-1,-1,3,1.000,0,0,0,0,0,0,0,-1,-1,0,-1,-1,0,unsupported_topology
+different_cores_same_socket,0,1,1,1.000,1.002494917,18331990,18865846,37197836,26.950,0,0,0,0,0,1,1,0,ok
+different_cores_same_socket,0,1,2,1.000,1.000349390,13199263,12380701,25579964,39.107,0,0,0,0,0,1,1,0,ok
+different_cores_same_socket,0,1,3,1.000,1.003542219,13550754,13280799,26831553,37.402,0,0,0,0,0,1,1,0,ok
+different_numa_or_socket,0,4,1,1.000,1.006349219,19350161,16636323,35986484,27.965,0,0,0,0,0,4,4,0,ok
+different_numa_or_socket,0,4,2,1.000,1.003658900,15748902,16997741,32746643,30.649,0,0,0,0,0,4,4,0,ok
+different_numa_or_socket,0,4,3,1.000,1.001352008,13916852,15811538,29728390,33.683,0,0,0,0,0,4,4,0,ok
+unpinned,-1,-1,1,1.000,1.000737234,13027877,13128204,26156081,38.260,0,0,4,3,1,2,2,0,ok
+unpinned,-1,-1,2,1.000,1.005538826,14798608,14845598,29644206,33.920,0,0,6,3,1,2,2,0,ok
+unpinned,-1,-1,3,1.000,1.000438378,16636462,15611933,32248395,31.023,0,0,5,1,1,0,0,0,ok

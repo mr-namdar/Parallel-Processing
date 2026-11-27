@@ -1,0 +1,7 @@
+N,layout,valid_runs,median_elapsed_s,median_ns_per_increment,status
+2,packed,3,0.012630575,0.316,ok
+2,padded,3,0.018255767,0.456,ok
+4,packed,3,0.035584998,0.445,ok
+4,padded,3,0.018636189,0.233,ok
+8,packed,3,0.047386804,0.296,ok
+8,padded,3,0.022086721,0.138,ok
