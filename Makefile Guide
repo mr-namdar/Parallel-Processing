@@ -10,3 +10,10 @@ task2 :
 
 make
 make task2-all
+
+task3 :
+
+make 
+make task3
+make task3-ttas-no-pause
+make task3-plots
