@@ -24,8 +24,9 @@ make
 make task4-all
 make task4-plots
 
-task4 :
+task5 :
 
 make
 make task5-all
 make task5-plots
+
